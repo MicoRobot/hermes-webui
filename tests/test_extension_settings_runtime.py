@@ -100,6 +100,26 @@ def test_extension_settings_runtime_normalizes_persists_resets_and_clears():
         const unknownSettings = window.HermesExtensionSettings.settingsForExtension('unknown.ext');
         assert.strictEqual(unknownSettings.setAll({{flag: true}}).ok, false);
         assert.strictEqual(store.has('hermes.ext.settings.unknown.ext'), false);
+
+        window.HermesExtensionSettings.primeFromStatus({{
+          extensions: [{{
+            id: 'demo.ext',
+            name: 'Demo',
+            storage_owned: true,
+            settings_schema: [{{key: 'evil', type: 'string', default: ''}}],
+          }}, {{
+            id: 'denied.ext',
+            name: 'Denied',
+            storage_owned: false,
+            settings_schema: [{{key: 'flag', type: 'boolean', default: false}}],
+          }}]
+        }});
+
+        const reprobe = window.HermesExtensionSettings.settingsForExtension('demo.ext');
+        assert.deepStrictEqual(reprobe.schema.map(field => field.key), ['flag', 'mode', 'count']);
+        assert.strictEqual(reprobe.set('evil', 'owned').ok, true);
+        assert.strictEqual(reprobe.get('evil'), undefined);
+        assert.strictEqual(store.has('hermes.ext.settings.demo.ext'), false);
         """
     )
     _run_node(script)

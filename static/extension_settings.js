@@ -125,6 +125,7 @@
           id:entry.id,
           name:entry.name,
           storage_owned:entry.storage_owned,
+          settings_schema:entry.settings_schema,
         });
       }
       trustedSeeded=true;
@@ -137,7 +138,7 @@
         id:entry.id,
         name:entry.name,
         storage_owned:trusted.storage_owned===true,
-        settings_schema:trusted.storage_owned===true?entry.settings_schema:[],
+        settings_schema:trusted.storage_owned===true?trusted.settings_schema:[],
       });
     }
   }

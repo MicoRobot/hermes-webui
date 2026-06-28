@@ -1575,9 +1575,11 @@ def inject_extension_tags(index_html: str) -> str:
         else:
             result = block + result
 
-    if script_tags:
+    if runtime_config["extensions"] or script_tags:
         body_marker = "</body>"
-        block = runtime_tag + "\n" + "\n".join(script_tags) + "\n"
+        block = runtime_tag + "\n"
+        if script_tags:
+            block += "\n".join(script_tags) + "\n"
         if body_marker in result:
             result = result.replace(body_marker, block + body_marker, 1)
         else:

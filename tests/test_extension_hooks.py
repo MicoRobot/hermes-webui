@@ -160,6 +160,37 @@ def test_extension_settings_runtime_config_injects_before_extension_scripts(tmp_
     assert injected.index("window.__HERMES_EXTENSION_CONFIG__") < injected.index("/extensions/settings-ok.js")
 
 
+def test_extension_settings_only_manifest_still_injects_runtime_config(tmp_path, monkeypatch):
+    root = tmp_path / "extensions"
+    root.mkdir()
+    (root / "manifest.json").write_text(
+        """
+        {
+          "extensions": [
+            {
+              "id": "settings-only",
+              "permissions": {"storage": {"owned": true}},
+              "settings_schema": [
+                {"key": "flag", "type": "boolean", "default": true}
+              ]
+            }
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_WEBUI_EXTENSION_DIR", str(root))
+    monkeypatch.setenv("HERMES_WEBUI_EXTENSION_MANIFEST", "manifest.json")
+
+    from api.extensions import inject_extension_tags
+
+    injected = inject_extension_tags("<html><head></head><body></body></html>")
+
+    assert "window.__HERMES_EXTENSION_CONFIG__" in injected
+    assert '"id":"settings-only"' in injected
+    assert injected.index("window.__HERMES_EXTENSION_CONFIG__") < injected.index("</body>")
+
+
 def test_extension_route_remains_behind_webui_auth(monkeypatch):
     monkeypatch.setenv("HERMES_WEBUI_PASSWORD", "test-password")
 
