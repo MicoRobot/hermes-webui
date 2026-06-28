@@ -72,7 +72,8 @@ def test_busy_placeholder_helper_preserves_compression_and_drafts():
     assert "_applyBusyComposerPlaceholder" in update_block
 
     busy_block = _function_block(UI_JS, "setBusy")
-    assert "_applyBusyComposerPlaceholder" in busy_block
+    assert "updateSendBtn();" in busy_block
+    assert "_applyBusyComposerPlaceholder" not in busy_block
 
 
 def test_locale_blocks_cover_new_keys():

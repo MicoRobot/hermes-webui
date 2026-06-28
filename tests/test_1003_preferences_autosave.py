@@ -5,7 +5,7 @@ preferences-panel autosave pattern is wired correctly:
 
 - All 15 preference fields use _schedulePreferencesAutosave (not _markSettingsDirty)
 - Password field MUST still call _markSettingsDirty (security: never autosave)
-- _preferencesPayloadFromUi covers all 14 fields
+- _preferencesPayloadFromUi covers all 15 fields
 - _setPreferencesAutosaveStatus uses the shared i18n keys
 - Status div exists in static/index.html
 - _autosavePreferencesSettings clears the dirty flag and hides the unsaved bar

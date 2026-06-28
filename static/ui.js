@@ -5990,7 +5990,6 @@ async function handleComposerPrimaryAction(){
 function setBusy(v){
   S.busy=v;
   updateSendBtn();
-  if(typeof _applyBusyComposerPlaceholder==='function') _applyBusyComposerPlaceholder();
   if(!v){
     if(typeof _clearActivityElapsedTimer==='function') _clearActivityElapsedTimer();
     setStatus('');
