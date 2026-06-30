@@ -90,6 +90,12 @@ def _sanitize_message(message: dict) -> dict | None:
     ts = message.get("timestamp")
     if isinstance(ts, (int, float)):
         sanitized["timestamp"] = ts
+    provider_details = message.get("provider_details")
+    if provider_details not in (None, ""):
+        sanitized["provider_details"] = str(provider_details)
+        provider_label = message.get("provider_details_label")
+        if provider_label not in (None, ""):
+            sanitized["provider_details_label"] = str(provider_label)
     return sanitized
 
 

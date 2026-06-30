@@ -6,6 +6,7 @@ INDEX_HTML = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
 BOOT_JS = (ROOT / "static" / "boot.js").read_text(encoding="utf-8")
 PANELS_JS = (ROOT / "static" / "panels.js").read_text(encoding="utf-8")
 I18N_JS = (ROOT / "static" / "i18n.js").read_text(encoding="utf-8")
+SESSIONS_JS = (ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
 SHARE_HTML = (ROOT / "static" / "share.html").read_text(encoding="utf-8")
 SHARE_JS = (ROOT / "static" / "share.js").read_text(encoding="utf-8")
 
@@ -58,3 +59,16 @@ def test_public_share_page_assets_exist():
     assert "/static/share.js" in SHARE_HTML
     assert "function _shareLoad()" in SHARE_JS
     assert "/api/share/" in SHARE_JS
+
+
+def test_session_action_menu_exposes_public_share_actions():
+    assert "_appendSessionShareActions(menu, session);" in SESSIONS_JS
+    assert "function _createOrRefreshSessionShare(session){" in SESSIONS_JS
+    assert "api('/api/share/create'" in SESSIONS_JS
+    assert "api('/api/share/revoke'" in SESSIONS_JS
+    assert "t('stop_sharing_session')" in SESSIONS_JS
+
+
+def test_public_share_page_renders_provider_details_blocks():
+    assert "provider-error-details" in SHARE_JS
+    assert "provider_details_label||'Provider details'" in SHARE_JS

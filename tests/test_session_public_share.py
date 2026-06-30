@@ -45,7 +45,12 @@ def _make_session_with_messages():
     session.title = "Shared Test"
     session.messages = [
         {"role": "user", "content": "Please summarize this."},
-        {"role": "assistant", "content": "Here is a concise summary."},
+        {
+            "role": "assistant",
+            "content": "Here is a concise summary.",
+            "provider_details": "HTTP 401: expired upstream token",
+            "provider_details_label": "Provider details",
+        },
         {"role": "tool", "content": "raw tool output should not be public"},
     ]
     session.workspace = "/very/private/workspace"
@@ -85,6 +90,8 @@ def test_public_share_payload_is_sanitized_and_read_only():
         assert share["message_count"] == 2
         assert [m["role"] for m in share["messages"]] == ["user", "assistant"]
         assert all("tool" != m["role"] for m in share["messages"])
+        assert share["messages"][1]["provider_details"] == "HTTP 401: expired upstream token"
+        assert share["messages"][1]["provider_details_label"] == "Provider details"
     finally:
         post("/api/session/delete", {"session_id": sid})
 
