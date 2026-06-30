@@ -14768,6 +14768,58 @@ _TTS_PROXY_MAX_BYTES = 16 * 1024 * 1024
 _TTS_LOCALHOST_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
 
+def _tts_host_is_blocked_target(hostname: str) -> bool:
+    """True if the hostname resolves to (or literally is) a private / loopback /
+    link-local / reserved / multicast address — the SSRF-risk targets that an
+    OpenAI-compatible TTS base_url must not be allowed to reach. Public hosts
+    (a user's own hosted OpenAI-compatible server) are allowed; the explicit
+    localhost-over-http dev case is handled separately by the caller."""
+    import ipaddress
+    import socket
+
+    host = (hostname or "").strip().lower()
+    if not host:
+        return True
+
+    def _addr_blocked(ip_str: str) -> bool:
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return False
+        return (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        )
+
+    # Literal IP host?
+    try:
+        ipaddress.ip_address(host)
+        return _addr_blocked(host)
+    except ValueError:
+        pass
+
+    # DNS host: resolve and block if ANY resolved address is a blocked target
+    # (defends against a hostname pointing at an internal/link-local address).
+    # A DNS-resolution failure is NOT treated as an SSRF block — an unresolvable
+    # host simply can't be reached (the outbound request fails naturally), and
+    # failing closed here would wrongly reject legitimate public hosts that don't
+    # resolve in a sandboxed/offline environment. Only a host that resolves to a
+    # blocked address is rejected.
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return False
+    for info in infos:
+        sockaddr = info[4]
+        if sockaddr and _addr_blocked(str(sockaddr[0])):
+            return True
+    return False
+
+
 def _normalized_openai_tts_base_url(base_url: str) -> str:
     from urllib.parse import urlsplit, urlunsplit
 
@@ -14779,8 +14831,13 @@ def _normalized_openai_tts_base_url(base_url: str) -> str:
     if not parsed.scheme or not parsed.netloc or parsed.query or parsed.fragment:
         raise ValueError("invalid OpenAI base_url in config")
     if parsed.scheme == "https":
-        pass
+        # Public https hosts are allowed (a user's own OpenAI-compatible server),
+        # but reject private/loopback/link-local/reserved targets to close the
+        # SSRF surface (e.g. https://169.254.169.254, https://10.x internal).
+        if _tts_host_is_blocked_target(hostname):
+            raise ValueError("invalid OpenAI base_url in config")
     elif parsed.scheme == "http" and hostname in _TTS_LOCALHOST_HOSTS:
+        # Explicit localhost-over-http dev/self-hosted case only.
         pass
     else:
         raise ValueError("invalid OpenAI base_url in config")
@@ -14804,6 +14861,12 @@ def _buffer_tts_audio_response(resp, *, max_bytes: int | None = None) -> bytes:
             content_type = str(info.get("Content-Type") or "")
         except Exception:
             content_type = ""
+    # A present Content-Type that isn't audio/* is rejected. A MISSING
+    # Content-Type is tolerated: some OpenAI-compatible servers stream audio
+    # bytes without setting Content-Type, and the success path defaults the
+    # browser-facing type to audio/mpeg (encoded in the tests). The SSRF
+    # base-url guard is the primary defense against reaching a non-audio
+    # internal endpoint.
     if content_type and not content_type.lower().startswith("audio/"):
         raise ValueError("upstream returned non-audio content")
     audio_data = bytearray()

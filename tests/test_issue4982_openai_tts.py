@@ -155,6 +155,13 @@ def test_openai_tts_config_overrides(monkeypatch):
     "http://169.254.169.254/v1",
     "https://user:pass@api.example.com/v1",
     "http://user:pass@localhost:8080/v1",
+    # SSRF: https to private / link-local / loopback / reserved literal IPs must
+    # be rejected even though the scheme is https (regression for #5079 gate).
+    "https://169.254.169.254/v1",
+    "https://10.0.0.5/v1",
+    "https://192.168.1.10/v1",
+    "https://127.0.0.1/v1",
+    "https://[::1]/v1",
 ])
 def test_openai_tts_rejects_invalid_base_url_config(monkeypatch, base_url):
     import api.config as config
