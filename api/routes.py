@@ -11852,7 +11852,7 @@ def handle_post(handler, parsed) -> bool:
             session = get_session(sid)
         except KeyError:
             return bad(handler, "Session not found", 404)
-        active_profile = get_active_profile_name()
+        active_profile = _get_active_profile_name()
         if not _profiles_match(getattr(session, "profile", None), active_profile):
             return bad(handler, "Session not found", 404)
         try:
@@ -11887,7 +11887,7 @@ def handle_post(handler, parsed) -> bool:
             session = get_session(sid)
         except KeyError:
             return bad(handler, "Session not found", 404)
-        active_profile = get_active_profile_name()
+        active_profile = _get_active_profile_name()
         if not _profiles_match(getattr(session, "profile", None), active_profile):
             return bad(handler, "Session not found", 404)
         revoke_share(session)
