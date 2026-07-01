@@ -6008,7 +6008,22 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                         str(_provider_cfg.get(_route_key) or "").strip()
                         for _route_key in ("api", "base_url", "api_key", "key_env")
                     )
-                if not (_is_known_provider or _has_provider_route):
+                # A models-only provider config (no api/base_url/api_key/key_env)
+                # is only admitted as evidence when it's the active/configured
+                # provider (e.g. the lmstudio-style custom shape from #1970).
+                # This must NOT re-open the door for a spurious duplicate alias
+                # of a known provider (e.g. ``copilot-2: {name: "copilot",
+                # models: {...}}`` from #644/dedup regression) — that case is
+                # still rejected because it isn't the active provider and it
+                # isn't a route-bearing config in its own right.
+                _has_models_only_active_route = (
+                    not _has_provider_route
+                    and _is_provider_config
+                    and isinstance(_provider_cfg.get("models"), (dict, list))
+                    and _provider_cfg["models"]
+                    and _canonical == _canonicalise_provider_id(active_provider)
+                )
+                if not (_is_known_provider or _has_provider_route or _has_models_only_active_route):
                     continue
 
                 _canonical_to_raw_provider_key.setdefault(_canonical, _pid_key)
