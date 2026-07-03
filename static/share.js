@@ -35,7 +35,7 @@ function _shareRenderMessages(messages){
       ? renderMd(String(msg.content||''))
       : `<p>${_shareEscapeHtml(msg.content||'')}</p>`;
     row.innerHTML=
-      `<div class="share-role"><span class="share-role-badge">${_shareEscapeHtml(_shareRoleLabel(msg.role))}</span><span>${_shareEscapeHtml(_shareRoleLabel(msg.role))}</span></div>`+
+      `<div class="share-role"><span class="share-role-badge">${_shareEscapeHtml(_shareRoleLabel(msg.role))}</span></div>`+
       `<div class="msg-body share-message-body">${bodyHtml}</div>`;
     wrap.appendChild(row);
   });
