@@ -90,13 +90,25 @@ def _sanitize_message(message: dict) -> dict | None:
     ts = message.get("timestamp")
     if isinstance(ts, (int, float)):
         sanitized["timestamp"] = ts
-    provider_details = message.get("provider_details")
-    if provider_details not in (None, ""):
-        sanitized["provider_details"] = str(provider_details)
-        provider_label = message.get("provider_details_label")
-        if provider_label not in (None, ""):
-            sanitized["provider_details_label"] = str(provider_label)
     return sanitized
+
+
+def _public_share_payload(payload: dict) -> dict:
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        messages = []
+    public = {
+        "title": str(payload.get("title") or "Untitled"),
+        "messages": messages,
+        "message_count": int(payload.get("message_count") or len(messages)),
+    }
+    created_at = payload.get("created_at")
+    updated_at = payload.get("updated_at")
+    if isinstance(created_at, (int, float)):
+        public["created_at"] = created_at
+    if isinstance(updated_at, (int, float)):
+        public["updated_at"] = updated_at
+    return public
 
 
 def build_share_snapshot(session) -> dict:
@@ -166,7 +178,7 @@ def load_share(token: str) -> dict | None:
         return None
     if payload.get("revoked_at"):
         return None
-    return payload
+    return _public_share_payload(payload)
 
 
 def revoke_share(session) -> bool:

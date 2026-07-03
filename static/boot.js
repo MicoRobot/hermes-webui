@@ -1519,7 +1519,7 @@ $('btnExportJSON').onclick=()=>{
 $('btnShareSession').onclick=async()=>{
   if(!S.session) return;
   try{
-    const existing=(S.session&&S.session.share_token)?new URL(`share/${encodeURIComponent(S.session.share_token)}`,document.baseURI||location.href).href:null;
+    const existing=(S.session&&S.session.share_token)?new URL(`/share/${encodeURIComponent(S.session.share_token)}`,location.origin).href:null;
     if(existing){
       const reuse=await showConfirmDialog({
         title:t('share_session'),
@@ -1536,7 +1536,7 @@ $('btnShareSession').onclick=async()=>{
     }
     const res=await api('/api/share/create',{method:'POST',body:JSON.stringify({session_id:S.session.session_id})});
     if(res&&res.session) S.session=res.session;
-    const href=new URL(String(res&&res.share&&res.share.url||''),document.baseURI||location.href).href;
+    const href=new URL(String(res&&res.share&&res.share.url||''),location.origin).href;
     await _copyText(href);
     showToast(t('share_session_created'));
     if(typeof _syncHermesPanelSessionActions==='function') _syncHermesPanelSessionActions();

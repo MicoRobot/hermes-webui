@@ -83,15 +83,17 @@ def test_public_share_payload_is_sanitized_and_read_only():
         assert status == 200
         assert headers.get("X-Robots-Tag") == "noindex, nofollow"
         share = payload["share"]
-        assert share["source_session_id"] == sid
         assert share["title"] == "Shared Test"
         assert "workspace" not in share
         assert "profile" not in share
+        assert "source_session_id" not in share
+        assert "token" not in share
+        assert "revoked_at" not in share
         assert share["message_count"] == 2
         assert [m["role"] for m in share["messages"]] == ["user", "assistant"]
         assert all("tool" != m["role"] for m in share["messages"])
-        assert share["messages"][1]["provider_details"] == "HTTP 401: expired upstream token"
-        assert share["messages"][1]["provider_details_label"] == "Provider details"
+        assert "provider_details" not in share["messages"][1]
+        assert "provider_details_label" not in share["messages"][1]
     finally:
         post("/api/session/delete", {"session_id": sid})
 
