@@ -3733,7 +3733,7 @@ function _appendSessionCopyLinkAction(menu, session){
 function _sessionPublicShareUrl(session){
   const token=session&&session.share_token?String(session.share_token).trim():'';
   if(!token) return '';
-  return new URL(`share/${encodeURIComponent(token)}`,document.baseURI||location.href).href;
+  return new URL(`/share/${encodeURIComponent(token)}`,location.origin).href;
 }
 
 function _syncSessionShareState(session, nextSession){
@@ -3773,7 +3773,7 @@ async function _createOrRefreshSessionShare(session){
   }
   const res=await api('/api/share/create',{method:'POST',body:JSON.stringify({session_id:session.session_id})});
   if(res&&res.session) _syncSessionShareState(session,res.session);
-  const href=new URL(String(res&&res.share&&res.share.url||''),document.baseURI||location.href).href;
+  const href=new URL(String(res&&res.share&&res.share.url||''),location.origin).href;
   await _copyTextToClipboard(href);
   showToast(existing?t('share_session_link_copied'):t('share_session_created'));
   window.open(href,'_blank','noopener');

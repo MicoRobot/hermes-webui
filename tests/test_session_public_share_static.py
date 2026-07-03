@@ -20,6 +20,7 @@ def test_conversation_panel_has_share_actions():
 
 def test_boot_js_wires_share_create_and_revoke():
     assert "$('btnShareSession').onclick=async()=>{" in BOOT_JS
+    assert "new URL(`/share/${encodeURIComponent(S.session.share_token)}`,location.origin).href" in BOOT_JS
     assert "api('/api/share/create'" in BOOT_JS
     assert "$('btnStopSharingSession').onclick=async()=>{" in BOOT_JS
     assert "api('/api/share/revoke'" in BOOT_JS
@@ -64,11 +65,12 @@ def test_public_share_page_assets_exist():
 def test_session_action_menu_exposes_public_share_actions():
     assert "_appendSessionShareActions(menu, session);" in SESSIONS_JS
     assert "function _createOrRefreshSessionShare(session){" in SESSIONS_JS
+    assert "new URL(`/share/${encodeURIComponent(token)}`,location.origin).href;" in SESSIONS_JS
     assert "api('/api/share/create'" in SESSIONS_JS
     assert "api('/api/share/revoke'" in SESSIONS_JS
     assert "t('stop_sharing_session')" in SESSIONS_JS
 
 
-def test_public_share_page_renders_provider_details_blocks():
-    assert "provider-error-details" in SHARE_JS
-    assert "provider_details_label||'Provider details'" in SHARE_JS
+def test_public_share_page_does_not_render_provider_details_blocks():
+    assert "provider-error-details" not in SHARE_JS
+    assert "provider_details_label||'Provider details'" not in SHARE_JS
