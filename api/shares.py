@@ -78,7 +78,7 @@ def _sanitize_message(message: dict) -> dict | None:
     if not isinstance(message, dict):
         return None
     role = str(message.get("role") or "").strip().lower()
-    if role not in {"user", "assistant", "system"}:
+    if role not in {"user", "assistant"}:
         return None
     text = _share_message_text(message)
     if not text:

@@ -44,6 +44,7 @@ def _make_session_with_messages():
     assert session is not None
     session.title = "Shared Test"
     session.messages = [
+        {"role": "system", "content": "internal system instructions should stay private"},
         {"role": "user", "content": "Please summarize this."},
         {
             "role": "assistant",
@@ -91,6 +92,7 @@ def test_public_share_payload_is_sanitized_and_read_only():
         assert "revoked_at" not in share
         assert share["message_count"] == 2
         assert [m["role"] for m in share["messages"]] == ["user", "assistant"]
+        assert all("system" != m["role"] for m in share["messages"])
         assert all("tool" != m["role"] for m in share["messages"])
         assert "provider_details" not in share["messages"][1]
         assert "provider_details_label" not in share["messages"][1]
@@ -130,3 +132,95 @@ def test_share_page_serves_public_html():
     assert status == 200
     assert "Hermes Shared Conversation" in body
     assert "static/share.js" in body
+
+
+def test_share_create_supports_raw_messaging_session_without_webui_sidecar():
+    from tests.test_gateway_sync import _ensure_state_db, _insert_gateway_session, _remove_test_sessions
+
+    conn = _ensure_state_db()
+    sid = "share_tg_external_001"
+    try:
+        _insert_gateway_session(
+            conn,
+            session_id=sid,
+            source="telegram",
+            title="Telegram Share",
+        )
+        payload, status = post("/api/share/create", {"session_id": sid})
+        assert status == 200
+        assert payload["ok"] is True
+        token = payload["share"]["token"]
+        assert token
+        assert payload["session"]["share_token"] == token
+        assert payload["session"]["session_source"] == "messaging"
+        assert payload["session"]["raw_source"] == "telegram"
+        assert [m["role"] for m in payload["session"]["messages"]] == ["user", "assistant"]
+
+        shared, status, _ = get(f"/api/share/{token}")
+        assert status == 200
+        assert shared["share"]["title"] == "Telegram Share"
+        assert [m["content"] for m in shared["share"]["messages"]] == [
+            "Hello from Telegram",
+            "Hi there!",
+        ]
+
+        revoked, status = post("/api/share/revoke", {"session_id": sid})
+        assert status == 200
+        assert revoked["session"]["share_token"] is None
+        assert [m["role"] for m in revoked["session"]["messages"]] == ["user", "assistant"]
+    finally:
+        try:
+            post("/api/session/delete", {"session_id": sid})
+        except Exception:
+            pass
+        _remove_test_sessions(conn, sid)
+        conn.close()
+
+
+def test_share_create_uses_messaging_display_transcript_when_sidecar_has_no_messages():
+    from api.models import Session
+    from tests.test_gateway_sync import _ensure_state_db, _insert_gateway_session, _remove_test_sessions
+
+    conn = _ensure_state_db()
+    sid = "share_discord_imported_001"
+    try:
+        _insert_gateway_session(
+            conn,
+            session_id=sid,
+            source="discord",
+            title="Discord Share",
+        )
+        local = Session(
+            session_id=sid,
+            title="Discord Share",
+            messages=[],
+            model="openai/gpt-5",
+            created_at=1.0,
+            updated_at=2.0,
+        )
+        local.is_cli_session = True
+        local.session_source = "messaging"
+        local.raw_source = "discord"
+        local.source_tag = "discord"
+        local.source_label = "Discord"
+        local.save(touch_updated_at=False)
+
+        payload, status = post("/api/share/create", {"session_id": sid})
+        assert status == 200
+        token = payload["share"]["token"]
+        assert token
+        assert [m["content"] for m in payload["session"]["messages"]] == [
+            "Hello from Telegram",
+            "Hi there!",
+        ]
+
+        shared, status, _ = get(f"/api/share/{token}")
+        assert status == 200
+        assert [m["content"] for m in shared["share"]["messages"]] == [
+            "Hello from Telegram",
+            "Hi there!",
+        ]
+    finally:
+        post("/api/session/delete", {"session_id": sid})
+        _remove_test_sessions(conn, sid)
+        conn.close()
