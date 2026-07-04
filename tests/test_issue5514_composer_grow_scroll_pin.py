@@ -16,7 +16,8 @@ Fix: `_repinMessagesAfterComposerResize()` (static/ui.js) re-pins the transcript
 to the bottom ONLY when the reader is genuinely still pinned (honors
 `_messageUserUnpinned` / `_scrollPinned` so a reader who scrolled away is never
 yanked back). It is called (a) from autoResize() and (b) from a ResizeObserver on
-the composer textarea that catches every height-change path.
+the #composerWrap wrapper that catches every height-change path (typed input,
+paste, draft restore, attachment tray / selection chip).
 
 This module verifies BOTH the static wiring and the helper's guard logic via a
 node `vm` sandbox that reproduces the pinned-vs-unpinned viewport-shrink scenario.
