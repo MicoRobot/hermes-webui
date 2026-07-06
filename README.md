@@ -220,6 +220,7 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 - Session tags -- add #tag to titles for colored chips and click-to-filter
 - Grouped by Today / Yesterday / Earlier in the sidebar (collapsible date groups)
 - Download as Markdown transcript, full JSON export, or import from JSON
+- Create a public read-only share link for the active conversation from the Control Center; shared pages show a sanitized transcript snapshot without workspace, profile, or live controls
 - Sessions persist across page reloads and SSH tunnel reconnects
 - Browser tab title reflects the active session name
 - CLI session bridge -- CLI sessions from hermes-agent's SQLite store appear in the sidebar with a gold "cli" badge; click to import with full history and reply normally
@@ -367,7 +368,7 @@ Full list of environment variables:
 | `HERMES_CONFIG_PATH` | `$HERMES_HOME/config.yaml` | Path to Hermes config file |
 | `HERMES_WEBUI_SERVER_CWD` | *(unset)* | Working directory for the server process. Defaults to the agent dir; point it at a writable workspace when the agent dir is read-only so fallback relative writes land somewhere writable |
 | `HERMES_WEBUI_AGENT_CACHE_MAX` | `25` | Max live agent instances kept warm in the in-memory LRU. Each pins a full conversation transcript, so this is the dominant lever on resident memory — lower it on installs with many long sessions to cap RAM (at the cost of more cold reloads) |
-| `HERMES_WEBUI_SESSIONS_MAX` | `100` | Max compact `Session` objects held in the in-memory LRU. Lighter than the agent cache; lower it on installs with hundreds of sessions |
+| `HERMES_WEBUI_SESSIONS_MAX` | `300` | Legacy operator override for the max compact `Session` objects held in the in-memory LRU. Prefer the `webui.sessions_cache_max` key in `config.yaml` (which takes precedence); this env var remains a fallback. Bounds resident memory so long-running installs cannot accumulate every session ever touched and eventually crash (#4765/#2233/#4633). Eviction only ever drops clean, persisted, non-active sessions — an evicted session lazily reloads from its JSON sidecar on next access |
 
 Extension deployments can inspect sanitized, authenticated diagnostics at `GET /api/extensions/status`; see [WebUI Extensions](docs/EXTENSIONS.md#diagnostics).
 
@@ -521,7 +522,7 @@ system/Homebrew interpreter.
 
 Tests run against an isolated server with a separate state directory.
 Production data and real cron jobs are never touched. Current snapshot:
-**~7,150 tests collected** across **~700 test files**, run in CI on Python 3.11,
+**~11,500 tests collected** across **~1,150 test files**, run in CI on Python 3.11,
 3.12, and 3.13 (3 parallel shards each).
 
 ---
@@ -567,7 +568,7 @@ boot.js           Mobile nav, voice input, theme/skin boot, bfcache handler
 **Tests + packaging**
 
 ```
-tests/            Pytest suite (~7,150 tests; isolated server/state fixtures)
+tests/            Pytest suite (~11,500 tests; isolated server/state fixtures)
 pyproject.toml    Tooling config (ruff lint gate) — not a packaged distribution
 Dockerfile        python:3.12-slim container image
 docker-compose.yml  Compose with named volume and optional auth

@@ -3,6 +3,7 @@ import collections
 import copy
 import datetime
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -159,6 +160,7 @@ _SESSION_INDEX_REBUILD_THREAD_TARGET: tuple[Path, Path] | None = None
 # WebUI sidebar polling path is single-process) but must wrap the WHOLE
 # load-modify-write/unlink sequence in both helpers.
 _WEBUI_ZERO_MESSAGE_ORPHAN_TOMBSTONE_LOCK = threading.Lock()
+_WEBUI_DELETED_SESSION_TOMBSTONE_LOCK = threading.Lock()
 
 # Path-safety contract for session IDs.  Accept alphanumerics, underscore, and
 # hyphen so API/gateway-issued ids (``api-*``, ``reachy-voice-*``) round-trip
@@ -512,6 +514,8 @@ def prune_session_from_index(session_id: str) -> None:
 
 WEBUI_ZERO_MESSAGE_ORPHAN_TOMBSTONE_CAP = 500
 WEBUI_ZERO_MESSAGE_ORPHAN_TOMBSTONE_VERSION = 1
+WEBUI_DELETED_SESSION_TOMBSTONE_CAP = 1000
+WEBUI_DELETED_SESSION_TOMBSTONE_VERSION = 1
 
 
 def _webui_zero_message_orphan_tombstone_file() -> "Path":
@@ -673,6 +677,98 @@ def _clear_webui_zero_message_orphan_tombstone(sid: str) -> None:
                 "Failed to remove empty webui zero-message orphan tombstone",
                 exc_info=True,
             )
+
+
+def _webui_deleted_session_tombstone_file() -> "Path":
+    return SESSION_DIR / "_deleted_webui_sessions.json"
+
+
+def _load_webui_deleted_session_tombstone() -> frozenset[str]:
+    p = _webui_deleted_session_tombstone_file()
+    if not p.exists():
+        return frozenset()
+    try:
+        raw = json.loads(p.read_text(encoding='utf-8'))
+    except Exception:
+        logger.debug("Failed to load webui deleted-session tombstone", exc_info=True)
+        return frozenset()
+    if not isinstance(raw, dict):
+        return frozenset()
+    try:
+        if int(raw.get("version", 0)) != WEBUI_DELETED_SESSION_TOMBSTONE_VERSION:
+            return frozenset()
+    except (TypeError, ValueError):
+        return frozenset()
+    ids = raw.get("ids", [])
+    if not isinstance(ids, list):
+        return frozenset()
+    return frozenset(
+        str(sid).strip() for sid in ids if str(sid or "").strip()
+    )
+
+
+def _save_webui_deleted_session_tombstone(ids) -> None:
+    try:
+        sorted_ids = sorted(set(
+            str(sid).strip() for sid in (ids or []) if str(sid or "").strip()
+        ))
+    except TypeError:
+        return
+    if len(sorted_ids) > WEBUI_DELETED_SESSION_TOMBSTONE_CAP:
+        sorted_ids = sorted_ids[-WEBUI_DELETED_SESSION_TOMBSTONE_CAP:]
+    payload = {
+        "version": WEBUI_DELETED_SESSION_TOMBSTONE_VERSION,
+        "ids": sorted_ids,
+    }
+    p = _webui_deleted_session_tombstone_file()
+    _tmp = None
+    try:
+        SESSION_DIR.mkdir(parents=True, exist_ok=True)
+        _tmp = p.with_suffix(
+            f'.tmp.{os.getpid()}.{threading.current_thread().ident}'
+        )
+        with open(_tmp, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(_tmp, p)
+    except Exception:
+        logger.debug("Failed to save webui deleted-session tombstone", exc_info=True)
+        if _tmp is not None:
+            try:
+                _tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def _record_webui_deleted_session_tombstone(sid: str) -> None:
+    sid = str(sid or "").strip()
+    if not sid:
+        return
+    with _WEBUI_DELETED_SESSION_TOMBSTONE_LOCK:
+        current = set(_load_webui_deleted_session_tombstone())
+        if sid in current:
+            return
+        current.add(sid)
+        _save_webui_deleted_session_tombstone(current)
+
+
+def _clear_webui_deleted_session_tombstone(sid: str) -> None:
+    sid = str(sid or "").strip()
+    if not sid:
+        return
+    with _WEBUI_DELETED_SESSION_TOMBSTONE_LOCK:
+        current = set(_load_webui_deleted_session_tombstone())
+        if sid not in current:
+            return
+        current.discard(sid)
+        if current:
+            _save_webui_deleted_session_tombstone(current)
+            return
+        try:
+            _webui_deleted_session_tombstone_file().unlink(missing_ok=True)
+        except Exception:
+            logger.debug("Failed to remove empty webui deleted-session tombstone", exc_info=True)
 
 
 def _active_stream_ids():
@@ -955,8 +1051,13 @@ class Session:
                  context_engine_state=None,
                  context_length=None, threshold_tokens=None,
                  last_prompt_tokens=None,
+                 compression_recovery=None,
+                 recommended_recovery_action=None,
+                 compression_recovery_source_session_id=None,
+                 compression_recovery_action=None,
                  truncation_watermark=None,
                  truncation_boundary=None,
+                 clear_generation=None,
                  gateway_routing=None, gateway_routing_history=None,
                  llm_title_generated: bool=False,
                  manual_title: bool=False,
@@ -968,6 +1069,8 @@ class Session:
                  enabled_toolsets=None,
                  composer_draft=None,
                  anchor_activity_scenes=None,
+                 share_token=None,
+                 share_created_at=None,
                  **kwargs):
         self.session_id = session_id or uuid.uuid4().hex[:12]
         self.title = title
@@ -1006,8 +1109,21 @@ class Session:
         self.context_length = context_length
         self.threshold_tokens = threshold_tokens
         self.last_prompt_tokens = last_prompt_tokens
+        self.compression_recovery = compression_recovery if isinstance(compression_recovery, dict) else {}
+        self.recommended_recovery_action = recommended_recovery_action
+        self.compression_recovery_source_session_id = (
+            str(compression_recovery_source_session_id).strip()
+            if compression_recovery_source_session_id
+            else None
+        )
+        self.compression_recovery_action = (
+            str(compression_recovery_action).strip()
+            if compression_recovery_action
+            else None
+        )
         self.truncation_watermark = truncation_watermark
         self.truncation_boundary = truncation_boundary
+        self.clear_generation = clear_generation
         self.gateway_routing = gateway_routing if isinstance(gateway_routing, dict) else None
         self.gateway_routing_history = gateway_routing_history if isinstance(gateway_routing_history, list) else []
         self.llm_title_generated = bool(llm_title_generated)
@@ -1026,6 +1142,8 @@ class Session:
         self.enabled_toolsets = enabled_toolsets  # List[str] or None — per-session toolset override
         self.composer_draft = composer_draft if isinstance(composer_draft, dict) else {}
         self.anchor_activity_scenes = anchor_activity_scenes if isinstance(anchor_activity_scenes, dict) else {}
+        self.share_token = str(share_token).strip() if share_token else None
+        self.share_created_at = share_created_at
         raw_message_count = kwargs.get('message_count')
         parsed_message_count = None
         if raw_message_count is not None:
@@ -1076,13 +1194,17 @@ class Session:
             'context_engine', 'compression_anchor_engine', 'compression_anchor_mode',
             'compression_anchor_details', 'context_engine_state',
             'context_length', 'threshold_tokens', 'last_prompt_tokens',
+            'compression_recovery', 'recommended_recovery_action',
+            'compression_recovery_source_session_id', 'compression_recovery_action',
             'truncation_watermark',
             'truncation_boundary',
+            'clear_generation',
             'gateway_routing', 'gateway_routing_history', 'llm_title_generated', 'manual_title',
             'parent_session_id',
             'worktree_path', 'worktree_branch', 'worktree_repo_root', 'worktree_created_at',
             'is_cli_session', 'source_tag', 'raw_source', 'session_source', 'source_label', 'read_only',
             'enabled_toolsets', 'composer_draft', 'anchor_activity_scenes',
+            'share_token', 'share_created_at',
         ]
         meta = {k: getattr(self, k, None) for k in METADATA_FIELDS}
         meta['message_count'] = len(self.messages or [])
@@ -1189,9 +1311,10 @@ class Session:
         if self.messages:
             try:
                 _clear_webui_zero_message_orphan_tombstone(self.session_id)
+                _clear_webui_deleted_session_tombstone(self.session_id)
             except Exception:
                 logger.debug(
-                    "Failed to clear webui zero-message orphan tombstone for %s",
+                    "Failed to clear webui tombstone for %s",
                     self.session_id,
                     exc_info=True,
                 )
@@ -1322,12 +1445,18 @@ class Session:
             'context_length': self.context_length,
             'threshold_tokens': self.threshold_tokens,
             'last_prompt_tokens': self.last_prompt_tokens,
+            'compression_recovery': self.compression_recovery,
+            'recommended_recovery_action': self.recommended_recovery_action,
             'gateway_routing': self.gateway_routing,
             'gateway_routing_history': self.gateway_routing_history,
             'manual_title': self.manual_title,
             # Only emit 'parent_session_id' when set (the /branch fork link, #1342).
             # Sessions without a fork must not leak None — see test_session_lineage_metadata_api.
             **({'parent_session_id': self.parent_session_id} if self.parent_session_id else {}),
+            **({
+                'compression_recovery_source_session_id': self.compression_recovery_source_session_id,
+                'compression_recovery_action': self.compression_recovery_action,
+            } if (self.compression_recovery_source_session_id or self.compression_recovery_action) else {}),
             **({
                 'worktree_path': self.worktree_path,
                 'worktree_branch': self.worktree_branch,
@@ -1348,6 +1477,8 @@ class Session:
             'read_only': self.read_only,
             'enabled_toolsets': self.enabled_toolsets,
             'composer_draft': self.composer_draft if isinstance(self.composer_draft, dict) else {},
+            'share_token': self.share_token,
+            'share_created_at': self.share_created_at,
             'is_streaming': _is_streaming_session(
                 self.active_stream_id, active_stream_ids
             ) if include_runtime else False,
@@ -2937,6 +3068,124 @@ def _cached_session_lags_disk(cached) -> bool:
     return False
 
 
+def _persisted_message_count(sid) -> int | None:
+    """Return the on-disk message count for *sid* without a full load (#4765).
+
+    Reads only the sidecar metadata prefix (and falls back to the sidebar
+    ``_index.json`` count) so the eviction safety check stays cheap even while
+    the global ``LOCK`` is held. Returns ``None`` when the sidecar is missing or
+    its count cannot be determined — callers treat that as "do not evict",
+    because we must never drop an in-memory session we cannot prove is on disk.
+    """
+    if not is_safe_session_id(sid):
+        return None
+    p = SESSION_DIR / f'{sid}.json'
+    if not p.exists():
+        return None
+    try:
+        prefix = _read_metadata_json_prefix(p)
+        if prefix:
+            parsed = json.loads(prefix)
+            count = _parse_nonnegative_int(parsed.get('message_count'))
+            if count is not None:
+                return count
+    except Exception:
+        # Fall through to the index-based fallback below.
+        pass
+    return _parse_nonnegative_int(_lookup_index_message_count(sid))
+
+
+def _session_is_evictable(s) -> bool:
+    """Return True only when *s* can be safely dropped from the LRU (#4765).
+
+    Eviction must never lose data or interrupt a live turn. A session is
+    evictable ONLY when ALL of the following hold:
+
+      * It is not streaming (no ``active_stream_id``).
+      * It has no in-flight/queued turn (no ``pending_user_message`` and no
+        ``pending_started_at``).
+      * Its full state is already persisted to the JSON sidecar, proven by the
+        on-disk ``message_count`` being at least the in-memory message count.
+        A metadata-only stub is inherently backed by disk, so it is evictable.
+
+    Anything we cannot positively prove is safe stays resident. Using slightly
+    more RAM for a session we are unsure about is strictly better than evicting
+    an active or unsaved session (task safety invariant: a half-done memory fix
+    that loses a session is worse than none).
+    """
+    if s is None:
+        return True  # nothing to protect; let the caller drop it
+    if getattr(s, 'active_stream_id', None):
+        return False
+    if getattr(s, 'pending_user_message', None):
+        return False
+    if getattr(s, 'pending_started_at', None):
+        return False
+    sid = getattr(s, 'session_id', None)
+    if not sid:
+        return False
+    # Metadata-only stubs never carry unsaved messages (messages=[] by design),
+    # so they are always disk-backed and safe to drop.
+    if getattr(s, '_loaded_metadata_only', False):
+        return True
+    in_memory_count = len(getattr(s, 'messages', None) or [])
+    if in_memory_count == 0:
+        # A zero-message session has nothing to lose. If it was never persisted
+        # (brand new, no sidecar) dropping it only discards an empty shell; the
+        # next access recreates it. If it is persisted, it is trivially clean.
+        return True
+    disk_count = _persisted_message_count(sid)
+    if disk_count is None:
+        return False  # cannot prove it is on disk → keep it resident
+    return disk_count >= in_memory_count
+
+
+def _evict_sessions_over_cap(cap: int | None = None) -> int:
+    """Evict clean, persisted, non-active sessions until len(SESSIONS) <= cap.
+
+    Replaces the previous blind ``SESSIONS.popitem(last=False)`` loops (#4765).
+    The blind loops could evict the least-recently-used entry even if it was
+    actively streaming or held unsaved messages, risking a dropped turn or lost
+    conversation. This walks the LRU from oldest to newest and removes only
+    entries that ``_session_is_evictable()`` proves are safe. An evicted session
+    transparently lazily reloads from its sidecar on the next ``get_session()``.
+
+    CALLER CONTRACT: the global ``LOCK`` MUST already be held (every call site
+    mutates ``SESSIONS`` under ``LOCK``). This function never acquires ``LOCK``
+    or any stream lock itself, so it cannot introduce a lock-ordering deadlock.
+
+    Returns the number of sessions evicted. If every over-cap candidate is
+    active/unsaved, the cache may temporarily exceed ``cap`` — that is the
+    intended safe behavior (never lose an active/unsaved session).
+    """
+    if cap is None:
+        try:
+            cap = _cfg.get_sessions_cache_max()
+        except Exception:
+            cap = SESSIONS_MAX
+    if not isinstance(cap, int) or cap < 1:
+        cap = SESSIONS_MAX if isinstance(SESSIONS_MAX, int) and SESSIONS_MAX >= 1 else 1
+    evicted = 0
+    # Iterate over a snapshot of ids in LRU order (oldest first). We stop as
+    # soon as we are at/below the cap. Skipping a non-evictable oldest entry and
+    # moving on lets us reclaim a slightly-newer clean entry instead of blocking
+    # eviction entirely behind one pinned active session.
+    for sid in list(SESSIONS.keys()):
+        if len(SESSIONS) <= cap:
+            break
+        candidate = SESSIONS.get(sid)
+        if _session_is_evictable(candidate):
+            SESSIONS.pop(sid, None)
+            evicted += 1
+    if len(SESSIONS) > cap:
+        logger.debug(
+            "SESSIONS cache above cap (%d > %d) after eviction pass: remaining "
+            "entries are active or unsaved and were preserved (#4765)",
+            len(SESSIONS), cap,
+        )
+    return evicted
+
+
 def get_session(sid, metadata_only=False):
     """Load a session, optionally with metadata only (skipping the messages array).
 
@@ -3018,8 +3267,7 @@ def get_session(sid, metadata_only=False):
         with LOCK:
             SESSIONS[sid] = s
             SESSIONS.move_to_end(sid)
-            while len(SESSIONS) > SESSIONS_MAX:
-                SESSIONS.popitem(last=False)  # evict least recently used
+            _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
         if not metadata_only:
             try:
                 synced_from_state = _sync_sidecar_from_state_db_if_newer(s)
@@ -3051,6 +3299,97 @@ def get_session(sid, metadata_only=False):
                 pass  # repair is best-effort
         return s
     raise KeyError(sid)
+
+
+_COMPRESSION_RECOVERY_PROFILE_UNSET = object()
+
+
+def _compression_recovery_child_matches(
+    session,
+    source_session_id: str,
+    action: str,
+    source_profile=_COMPRESSION_RECOVERY_PROFILE_UNSET,
+) -> bool:
+    if source_profile is not _COMPRESSION_RECOVERY_PROFILE_UNSET:
+        try:
+            from api.profiles import _profiles_match
+        except (ImportError, AttributeError):
+            logger.debug("Failed to profile-check compression recovery session", exc_info=True)
+            return False
+        if not _profiles_match(getattr(session, "profile", None), source_profile):
+            return False
+    return (
+        str(getattr(session, "compression_recovery_source_session_id", "") or "").strip() == source_session_id
+        and str(getattr(session, "compression_recovery_action", "") or "").strip() == action
+    )
+
+
+def find_compression_recovery_session(
+    source_session_id: str,
+    action: str,
+    source_profile=_COMPRESSION_RECOVERY_PROFILE_UNSET,
+):
+    """Return an existing focused recovery child for ``source_session_id``.
+
+    The recovery-start endpoint is a retryable UI action. A persisted marker on
+    the child session makes double-clicks, repeated calls, and cache reloads
+    converge on the same continuation instead of creating duplicate siblings.
+    """
+
+    source_sid = str(source_session_id or "").strip()
+    recovery_action = str(action or "").strip()
+    if not source_sid or not recovery_action:
+        return None
+
+    matches = []
+    seen_ids: set[str] = set()
+    try:
+        with LOCK:
+            memory_sessions = list(SESSIONS.values())
+        for session in memory_sessions:
+            sid = str(getattr(session, "session_id", "") or "").strip()
+            if sid:
+                seen_ids.add(sid)
+            if _compression_recovery_child_matches(session, source_sid, recovery_action, source_profile):
+                matches.append(session)
+    except Exception:
+        logger.debug("Failed to scan cached compression recovery sessions", exc_info=True)
+
+    try:
+        persisted_ids = _persisted_session_ids_snapshot()
+    except Exception:
+        persisted_ids = frozenset()
+    for sid in persisted_ids:
+        if sid in seen_ids:
+            continue
+        try:
+            meta = Session.load_metadata_only(sid)
+        except Exception:
+            logger.debug("Failed to inspect compression recovery session %s", sid, exc_info=True)
+            continue
+        if not meta or not _compression_recovery_child_matches(meta, source_sid, recovery_action, source_profile):
+            continue
+        try:
+            matches.append(get_session(sid))
+        except Exception:
+            matches.append(meta)
+
+    if not matches:
+        return None
+
+    def _sort_key(session):
+        try:
+            created_at = float(getattr(session, "created_at", 0) or 0)
+        except (TypeError, ValueError):
+            created_at = 0.0
+        try:
+            updated_at = float(getattr(session, "updated_at", 0) or 0)
+        except (TypeError, ValueError):
+            updated_at = 0.0
+        return (created_at, updated_at, str(getattr(session, "session_id", "") or ""))
+
+    return sorted(matches, key=_sort_key)[0]
+
 
 def _profile_default_model_state(profile=None):
     """Return the default model/provider configured for *profile*."""
@@ -3135,17 +3474,17 @@ def new_session(workspace=None, model=None, profile=None, model_provider=None, p
     # must never block new-session creation.
     try:
         _clear_webui_zero_message_orphan_tombstone(s.session_id)
+        _clear_webui_deleted_session_tombstone(s.session_id)
     except Exception:
         logger.debug(
-            "Failed to clear webui zero-message orphan tombstone for %s",
+            "Failed to clear webui tombstone for %s",
             s.session_id,
             exc_info=True,
         )
     with LOCK:
         SESSIONS[s.session_id] = s
         SESSIONS.move_to_end(s.session_id)
-        while len(SESSIONS) > SESSIONS_MAX:
-            SESSIONS.popitem(last=False)
+        _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
     if wt:
         s.save()
     return s
@@ -4028,6 +4367,20 @@ def _apply_sidebar_state_db_override_metadata(sessions: list[dict], metadata: di
             session['session_source'] = state_db_session_source
             session['source_label'] = state_db_source_label
             session['is_cli_session'] = False
+        # Overlay the real state.db message count for WebUI-owned rows AND for
+        # delegated subagent children (#5308). A subagent child
+        # (state_db_source == 'subagent') is backed by the delegate runner's
+        # state.db session, but its sidebar row is built from a stale sidecar
+        # that often reports message_count == 0. Without overlaying the true
+        # count, the front-end visibility predicate
+        # (_sidebarRowHasVisibleMessages) drops the row and the subagent
+        # session vanishes from the sidebar entirely (regression seam behind
+        # #5308, same state.db-blind-metadata root as the #5307 transcript
+        # recovery). The count overlay keeps the same conservative
+        # anti-resurrection guard used for WebUI rows. The source-tag / title
+        # reassignment above stays WebUI-only — a subagent child keeps its
+        # subagent classification.
+        if state_db_source in ('webui', 'subagent'):
             try:
                 current_count = max(0, int(session.get('message_count') or 0))
                 state_count = max(0, int(state_db_message_count or 0))
@@ -4442,7 +4795,7 @@ CRON_PROJECT_NAME = 'Cron Jobs'
 _CRON_PROJECT_LOCK = threading.Lock()
 
 
-def ensure_cron_project() -> str:
+def ensure_cron_project(create: bool = True) -> str | None:
     """Return the project_id of the system "Cron Jobs" project for the active profile.
 
     Each profile gets its own "Cron Jobs" project so cron-spawned sessions in
@@ -4451,7 +4804,16 @@ def ensure_cron_project() -> str:
     `profile` field) is treated as belonging to whichever profile first calls
     this in a given install, then re-tagged.
 
-    Thread-safe and idempotent.  Returns a 12-char hex project_id string.
+    When `create` is False, only an EXISTING per-profile cron project is
+    resolved (exact tag, renamed-root alias, or legacy-untagged back-tag);
+    no new project is minted and None is returned instead. Callers gate
+    `create` on `_profile_has_user_projects()` so cron sessions don't force
+    a "Cron Jobs" chip onto installs that never opted into project
+    organization (#5379). Direct callers that omit `create` keep today's
+    unconditional-create behavior.
+
+    Thread-safe and idempotent.  Returns a 12-char hex project_id string, or
+    None if `create` is False and no existing cron project resolves.
     """
     from api.profiles import get_active_profile_name, _is_root_profile
 
@@ -4476,6 +4838,8 @@ def ensure_cron_project() -> str:
                 p['profile'] = active
                 save_projects(projects)
                 return p['project_id']
+        if not create:
+            return None
         # Otherwise create a new one tagged with the active profile.
         project_id = uuid.uuid4().hex[:12]
         projects.append({
@@ -4523,6 +4887,32 @@ def ensure_webhook_project() -> str:
         })
         save_projects(projects)
         return project_id
+
+
+def _profile_has_user_projects() -> bool:
+    """True if the active profile already has at least one real (non-system) project.
+
+    "Opted into project organization" means `load_projects()` contains a
+    project whose name is not a reserved system name (`CRON_PROJECT_NAME`,
+    `WEBHOOK_PROJECT_NAME`), tagged to the active profile or its renamed-root
+    alias. Profile/alias matching mirrors `ensure_cron_project`'s own lookup
+    so the two never disagree about which profile a project belongs to.
+
+    Read-only: never mutates projects.json, safe to call as often as needed.
+    """
+    from api.profiles import get_active_profile_name, _is_root_profile
+
+    active = get_active_profile_name() or 'default'
+    reserved = {CRON_PROJECT_NAME, WEBHOOK_PROJECT_NAME}
+    for p in load_projects():
+        if p.get('name') in reserved:
+            continue
+        row_profile = p.get('profile')
+        if row_profile == active:
+            return True
+        if _is_root_profile(row_profile or 'default') and _is_root_profile(active):
+            return True
+    return False
 
 
 def is_cron_session(session_id: str, source_tag: str | None = None) -> bool:
@@ -4573,9 +4963,10 @@ def import_cli_session(
     # an import.
     try:
         _clear_webui_zero_message_orphan_tombstone(s.session_id)
+        _clear_webui_deleted_session_tombstone(s.session_id)
     except Exception:
         logger.debug(
-            "Failed to clear webui zero-message orphan tombstone for %s",
+            "Failed to clear webui tombstone for %s",
             s.session_id,
             exc_info=True,
         )
@@ -5097,6 +5488,19 @@ def _path_stat_cache_key(path):
         return None
 
 
+def _callable_accepts_include_claude_code(callable_obj) -> bool:
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return True
+    if 'include_claude_code' in signature.parameters:
+        return True
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+
+
 def _sqlite_content_fingerprint(db_path: Path):
     """Return a commit-reliable content fingerprint for a state.db.
 
@@ -5222,7 +5626,7 @@ def _cli_sessions_streaming_freeze_marker():
         return ("streaming",)
 
 
-def _resolve_cli_sessions_context(source_filter=None):
+def _resolve_cli_sessions_context(source_filter=None, include_claude_code: bool = True):
     # Use the active WebUI profile's HERMES_HOME to find state.db.
     # The active profile is determined by what the user has selected in the UI
     # (stored in the server's runtime config). This means:
@@ -5259,6 +5663,7 @@ def _resolve_cli_sessions_context(source_filter=None):
         str(db_path),
         str(source_filter or ''),
         db_state_key,
+        bool(include_claude_code),
         _path_cache_key(projects_dir),
         _path_stat_cache_key(projects_dir),
         _path_stat_cache_key(SESSION_INDEX_FILE),
@@ -5408,11 +5813,17 @@ def _load_cli_sessions_uncached(
     # Memoize the cron project ID for this scan so we don't pay a lock-acquire +
     # disk-read of projects.json per cron session in the loop below.
     # Resolved lazily on the first cron session we encounter.
-    _cron_pid_cache = [None]  # list-as-cell so the closure can mutate
+    # [resolved, project_id_or_None] — a plain `[None]` sentinel can't tell
+    # "not yet resolved" apart from "resolved to None" (the gated-closed
+    # case), which would re-pay the load_projects() read on every cron row
+    # in a cron-heavy zero-user-project scan — the exact I/O blowup #4842
+    # fixed, reintroduced by this gate if left as a bare None check.
+    _cron_pid_cache: list = [False, None]
     def _cron_pid():
-        if _cron_pid_cache[0] is None:
-            _cron_pid_cache[0] = ensure_cron_project()
-        return _cron_pid_cache[0]
+        if not _cron_pid_cache[0]:
+            _cron_pid_cache[0] = True
+            _cron_pid_cache[1] = ensure_cron_project(create=_profile_has_user_projects())
+        return _cron_pid_cache[1]
 
     # Memoize the cron jobs.json job_id -> name map for this scan. The two row
     # loops below each looked up a cron job's friendly name by re-reading and
@@ -5470,6 +5881,16 @@ def _load_cli_sessions_uncached(
         return None
 
     profile_value = _cli_profile or 'default'
+    # A deleted WebUI session is tombstoned (see _record_webui_deleted_session_tombstone)
+    # so recovery/audit/claim treat it as gone. The sidebar's own state.db projection
+    # must honor the same tombstone, or a deleted WebUI session reappears here as an
+    # "Agent" ghost the moment non-WebUI sessions are shown (#5498, second path). Only
+    # suppress genuine WebUI rows with no live sidecar — a re-created/re-imported sid
+    # (live {sid}.json) always beats a stale tombstone.
+    try:
+        _deleted_webui_tombstone = _load_webui_deleted_session_tombstone()
+    except Exception:
+        _deleted_webui_tombstone = frozenset()
     for row in read_importable_agent_session_rows(
         db_path,
         limit=visible_session_limit if visible_session_limit is not None else (
@@ -5488,6 +5909,14 @@ def _load_cli_sessions_uncached(
         profile = profile_value  # CLI DB has no profile column; use active profile
 
         _source = row['source'] or 'cli'
+        # Honor the deleted-WebUI tombstone: a WebUI row the user deleted must
+        # not resurface in this projection (the #5498 ghost). Live sidecar wins.
+        if (
+            _source == 'webui'
+            and sid in _deleted_webui_tombstone
+            and not (SESSION_DIR / f"{sid}.json").exists()
+        ):
+            continue
         _source_meta = normalize_agent_session_source(_source)
         _title = row['title']
         if not _title and _source == 'cron':
@@ -5684,7 +6113,12 @@ def _load_cli_sessions_uncached(
     return cli_sessions
 
 
-def get_cli_sessions(source_filter=None, *, all_profiles: bool = False) -> list:
+def get_cli_sessions(
+    source_filter=None,
+    *,
+    all_profiles: bool = False,
+    include_claude_code: bool = True,
+) -> list:
     """Read CLI sessions from the agent's SQLite store and return them as
     dicts in a format the WebUI sidebar can render alongside local sessions.
 
@@ -5704,34 +6138,61 @@ def get_cli_sessions(source_filter=None, *, all_profiles: bool = False) -> list:
         cache_key = (
             'all_profiles',
             source_filter or '',
+            bool(include_claude_code),
             context_cache_key,
             _path_cache_key(_default_claude_code_projects_dir()),
             _path_stat_cache_key(_default_claude_code_projects_dir()),
             _path_stat_cache_key(SESSION_INDEX_FILE),
         )
     else:
-        hermes_home, db_path, cli_profile, cache_key = _resolve_cli_sessions_context(source_filter)
+        resolve_kwargs = {}
+        resolve_supports_include_claude_code = _callable_accepts_include_claude_code(
+            _resolve_cli_sessions_context
+        )
+        if resolve_supports_include_claude_code:
+            resolve_kwargs['include_claude_code'] = include_claude_code
+        hermes_home, db_path, cli_profile, cache_key = _resolve_cli_sessions_context(
+            source_filter,
+            **resolve_kwargs,
+        )
+        if not resolve_supports_include_claude_code:
+            cache_key = cache_key + (bool(include_claude_code),)
     ttl = _cli_sessions_cache_ttl_seconds()
     now = time.monotonic()
 
     def _load_sessions():
+        loader_supports_include_claude_code = _callable_accepts_include_claude_code(
+            _load_cli_sessions_uncached
+        )
         if all_profiles:
             merged: list[dict] = []
             for idx, (ctx_home, ctx_db_path, ctx_profile) in enumerate(contexts):
+                load_kwargs = {
+                    'source_filter': source_filter,
+                    'visible_session_limit': None,
+                    'cron_project_limit': None,
+                    'webhook_project_limit': None,
+                }
+                if loader_supports_include_claude_code:
+                    load_kwargs['include_claude_code'] = include_claude_code and idx == 0
                 merged.extend(
                     _load_cli_sessions_uncached(
                         ctx_home,
                         ctx_db_path,
                         ctx_profile,
-                        source_filter=source_filter,
-                        visible_session_limit=None,
-                        cron_project_limit=None,
-                        webhook_project_limit=None,
-                        include_claude_code=(idx == 0),
+                        **load_kwargs,
                     )
                 )
             return merged
-        return _load_cli_sessions_uncached(hermes_home, db_path, cli_profile, source_filter=source_filter)
+        load_kwargs = {'source_filter': source_filter}
+        if loader_supports_include_claude_code:
+            load_kwargs['include_claude_code'] = include_claude_code
+        return _load_cli_sessions_uncached(
+            hermes_home,
+            db_path,
+            cli_profile,
+            **load_kwargs,
+        )
 
     if ttl > 0:
         stale_sessions = None
@@ -5804,6 +6265,7 @@ def get_state_db_session_messages(
     stitch_continuations: bool = False,
     profile=None,
     since_timestamp=None,
+    include_inactive: bool = False,
 ) -> list:
     """Read messages for a Hermes session from state.db.
 
@@ -5819,6 +6281,13 @@ def get_state_db_session_messages(
     raw state.db scan to rows at or after a sidecar-derived timestamp floor while
     preserving the caller's normal merge/window logic.  Full-history callers must
     leave it unset.
+
+    When the messages table exposes an ``active`` column, inactive rows are
+    compacted/archived history and are intentionally excluded by default. WebUI
+    reconciliation feeds this reader straight into the next model context; pulling
+    ``active=0`` archive rows back in resurrects pre-compaction history and can
+    make every later turn re-trigger compression. Pass ``include_inactive=True``
+    only for explicit recovery/audit views.
     """
     try:
         import sqlite3
@@ -5910,11 +6379,15 @@ def get_state_db_session_messages(
                 if since_ts is not None:
                     since_clause = " AND (timestamp IS NULL OR timestamp >= ?)"
                     params.append(since_ts)
+            active_clause = ""
+            if 'active' in available and not include_inactive:
+                active_clause = " AND (active IS NULL OR active != 0)"
             cur.execute(f"""
                 SELECT {', '.join(selected)}, session_id
                 FROM messages
                 WHERE session_id IN ({placeholders})
                 {since_clause}
+                {active_clause}
                 ORDER BY timestamp ASC, id ASC
             """, params)
             msgs = []
@@ -6192,9 +6665,31 @@ def _loose_session_message_content(value: str) -> str:
 def _session_message_content_key(msg: dict):
     if not isinstance(msg, dict):
         return ("non_dict", repr(msg))
+    role = str(msg.get("role") or "")
+    content = _normalized_session_message_content(msg)
+    if role == "user":
+        # WebUI sends the model a workspace-prefixed user_message
+        # ("[Workspace::v1: /path]\n<text>") while the visible/optimistic
+        # bubble and the WebUI sidecar row carry only the bare "<text>". The
+        # streaming dedup identity (_message_identity in api/streaming.py)
+        # strips this prefix for user turns, so this reconciliation key must
+        # do the same. Otherwise a state.db row (prefixed) and a sidecar row
+        # (bare) key DIFFERENTLY, the alignment loop in
+        # state_db_delta_after_context fails to match them, treats the
+        # state.db copy as a NEW row, and appends a duplicate user turn. The
+        # agent then merges the two adjacent user rows into a permanent
+        # composite -- the post-restart stale-user-prepend bug (#5339). Reuse
+        # the SAME helper as the streaming side (imported lazily to avoid a
+        # circular import; api.streaming imports api.models at module load) so
+        # the two dedup layers can't drift apart again.
+        from api.streaming import _strip_workspace_prefix
+
+        content = " ".join(
+            _strip_workspace_prefix(content, include_legacy=True).split()
+        )
     return (
-        str(msg.get("role") or ""),
-        _normalized_session_message_content(msg),
+        role,
+        content,
         str(msg.get("tool_call_id") or ""),
         str(msg.get("tool_name") or msg.get("name") or ""),
     )
