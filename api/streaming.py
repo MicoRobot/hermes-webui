@@ -44,6 +44,7 @@ from api.config import (
 )
 from api.helpers import redact_session_data, _redact_text
 from api.compression_anchor import is_context_compression_marker, visible_messages_for_anchor
+from api.compression_recovery import stamp_compression_exhausted_recovery
 from api.metering import meter
 from api.run_journal import RunJournalWriter
 from api.todo_state import attach_todo_state, emit_todo_state
@@ -51,6 +52,7 @@ from api.turn_journal import append_turn_journal_event_for_stream
 from api.usage import prompt_cache_hit_percent
 from api.models import (
     _is_empty_partial_activity_message,
+    _evict_sessions_over_cap,
     get_state_db_session_messages,
     reconciled_state_db_messages_for_session,
 )
@@ -1194,8 +1196,20 @@ def _classify_provider_error(err_str: str, exc=None, *, silent_failure: bool = F
             'hint': 'The run stopped before a provider response completed. If you did not cancel it, try again.',
         }
     _is_quota = _is_quota_error_text(err_str)
+    # A credential-POOL exhaustion ("All 0 credential(s) exhausted for <provider>")
+    # is a distinct shape from account/plan quota: it means the profile's
+    # credential pool has no usable keys for that provider (a config problem),
+    # not that a funded account ran out of credits. It is NOT matched by
+    # _is_quota_error_text ('credential(s) exhausted' != 'credits exhausted'), so
+    # without this it fell through to the generic error label/hint. Classify it
+    # explicitly so the user gets a pool-specific, actionable hint. (#3929)
+    _is_credential_pool_empty = (
+        'credential(s) exhausted' in _err_lower
+        or 'credentials exhausted' in _err_lower
+        or ('credential' in _err_lower and 'exhausted' in _err_lower)
+    )
     _is_auth = (
-        not _is_quota and (
+        not _is_quota and not _is_credential_pool_empty and (
             _probe_status_code == 401
             or
             '401' in err_str
@@ -1227,6 +1241,12 @@ def _classify_provider_error(err_str: str, exc=None, *, silent_failure: bool = F
         or ('context length exceeded' in _err_lower and 'cannot compress further' in _err_lower)
         or ('context compression' in _err_lower and 'max compression attempts' in _err_lower)
     )
+    if _is_credential_pool_empty:
+        return {
+            'label': 'No usable credentials',
+            'type': 'credential_pool_empty',
+            'hint': 'The credential pool for this provider has no usable keys left (all entries exhausted or unconfigured). Add or refresh a key for this provider in your Hermes config / credential pool, or switch providers via `hermes model`.',
+        }
     if _is_quota:
         return {
             'label': 'Out of credits',
@@ -1308,6 +1328,43 @@ def _drop_synthetic_max_iteration_summary_requests(messages, *, enabled: bool = 
         msg
         for msg in list(messages or [])
         if not _is_synthetic_max_iteration_summary_request(msg)
+    ]
+
+
+# Structured markers the Hermes Agent stamps on synthetic scaffolding turns that
+# drive its internal verify-before-finish loop. The agent appends BOTH a
+# synthetic assistant "premature done" answer AND a synthetic ``user`` nudge
+# (e.g. "[System: You edited code in this turn, but the workspace does not have
+# fresh passing verification evidence yet...]") to preserve role alternation for
+# the next API turn, and flags each with one of these keys. They exist only to
+# run the loop; they must never surface as visible user/assistant turns in the
+# WebUI transcript. This mirrors ``run_agent._EPHEMERAL_SCAFFOLDING_FLAGS`` on
+# the agent side (which keeps them out of the durable session store); WebUI
+# honors the same markers when building the visible transcript. Keep roughly in
+# sync with the agent set. (#5334; same class as #3320/#3821/#4373/#4875)
+_SYNTHETIC_CONTROL_MESSAGE_FLAGS = (
+    "_verification_stop_synthetic",
+    "_pre_verify_synthetic",
+)
+
+
+def _is_synthetic_control_message(message) -> bool:
+    """Return True for an Agent-internal synthetic scaffolding turn flagged by marker."""
+    return isinstance(message, dict) and any(
+        message.get(flag) for flag in _SYNTHETIC_CONTROL_MESSAGE_FLAGS
+    )
+
+
+def _drop_synthetic_control_messages(messages):
+    """Remove Agent-internal synthetic scaffolding turns from the WebUI transcript.
+
+    Honors the structured ``_verification_stop_synthetic`` / ``_pre_verify_synthetic``
+    markers the agent already sets, rather than string-matching the nudge copy.
+    """
+    return [
+        msg
+        for msg in list(messages or [])
+        if not _is_synthetic_control_message(msg)
     ]
 
 
@@ -4132,6 +4189,46 @@ def _deduplicate_context_messages(messages):
     return deduped
 
 
+def _assign_stable_message_ids(result_messages, *existing_arrays):
+    """Mint a stable, session-unique integer ``id`` on model-result rows lacking one.
+
+    Both ``messages`` (display transcript) and ``context_messages`` (model-facing
+    history) are derived from the *same* per-turn ``result['messages']`` dicts.
+    Stamping the id on those shared dicts here makes each logical row carry an
+    identical id in both arrays, so the fork/truncate aligner
+    (``session_ops.truncate_context_for_display_keep``) can match rows by its
+    preferred ``id`` key instead of the fragile content-signature fallback that
+    goes blind on large sessions full of structurally-identical rows.
+
+    Ids are monotonic within a session (max existing id + 1, seeded from the
+    result rows plus any ``existing_arrays`` passed for collision-avoidance).
+    Across sessions ids may repeat, which is safe: alignment only ever compares
+    rows within one session, and a fork copies both arrays together so the child
+    stays internally consistent. Rows whose historical id was carried forward by
+    ``_restore_reasoning_metadata`` keep it; only genuinely new rows are minted.
+
+    Returns the number of rows newly stamped. Mutates ``result_messages`` in place.
+    """
+    if not result_messages:
+        return 0
+    seed = 0
+    for arr in (result_messages, *existing_arrays):
+        for m in arr or []:
+            if isinstance(m, dict):
+                mid = m.get('id')
+                # bool is an int subclass; exclude it so a stray True/False id
+                # can never seed the counter.
+                if isinstance(mid, int) and not isinstance(mid, bool) and mid > seed:
+                    seed = mid
+    stamped = 0
+    for m in result_messages:
+        if isinstance(m, dict) and m.get('id') is None:
+            seed += 1
+            m['id'] = seed
+            stamped += 1
+    return stamped
+
+
 def _prune_context_tool_results_after_compression(agent, context_messages):
     """Run the active compressor's cheap tool-result pruning on model context.
 
@@ -4197,6 +4294,13 @@ def _restore_reasoning_metadata(previous_messages, updated_messages):
         if isinstance(prev_msg, dict) and isinstance(cur_msg, dict) and _safe_projection(prev_msg) == _safe_projection(cur_msg):
             if prev_msg.get('role') == 'assistant' and prev_msg.get('reasoning') and not cur_msg.get('reasoning'):
                 cur_msg['reasoning'] = prev_msg['reasoning']
+            # Carry the stable per-message id (#context-message-stable-id) forward
+            # the same way timestamp is carried. The agent rebuilds result rows
+            # without our id every turn; without this, historical context rows
+            # would be re-minted a fresh id each turn and drift out of alignment
+            # with their display counterpart.
+            if prev_msg.get('id') is not None and cur_msg.get('id') is None:
+                cur_msg['id'] = prev_msg['id']
             if prev_msg.get('timestamp') and not cur_msg.get('timestamp'):
                 cur_msg['timestamp'] = prev_msg['timestamp']
             elif prev_msg.get('_ts') and not cur_msg.get('_ts') and not cur_msg.get('timestamp'):
@@ -4941,6 +5045,15 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
         m for m in list(previous_display or [])
         if not _is_context_compression_marker(m)
     ]
+    # Drop Hermes Agent internal verify-loop scaffolding (synthetic "premature
+    # done" answer + the "[System: ...verification evidence...]" nudge) before
+    # it can become a visible user/assistant turn. The agent flags these with
+    # structured markers (_verification_stop_synthetic / _pre_verify_synthetic)
+    # and already keeps them out of its own durable store; honor the same
+    # markers here so they never leak into the WebUI transcript. Filter all
+    # three inputs consistently so prefix/delta detection below stays aligned.
+    # (#5334; same internal-control-message class as #3320/#3821/#4373/#4875)
+    previous_display = _drop_synthetic_control_messages(previous_display)
     # Deduplicate stale _partial messages that accumulated in previous_display.
     # A bug in cancel_stream() could insert multiple identical _partial messages
     # when _stripped was empty but _has_reasoning/_has_tools was True. The
@@ -4967,6 +5080,11 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
     previous_display = _deduped
     previous_context = list(previous_context or [])
     result_messages = list(result_messages or [])
+    # Same marker filter for the model-history inputs: the synthetic verify-loop
+    # answer/nudge live in the agent's returned messages and prior context, and
+    # would otherwise slip into the merged transcript as a real delta. (#5334)
+    previous_context = _drop_synthetic_control_messages(previous_context)
+    result_messages = _drop_synthetic_control_messages(result_messages)
     if not result_messages:
         return previous_display
     previous_user_tail = _stale_user_tail_candidate(_last_user_row(previous_context))
@@ -5165,6 +5283,18 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
             # before the agent runs. When the agent returns that same user turn
             # in result_messages, keep the durable checkpoint and append only
             # the assistant/tool delta.
+            # The eager checkpoint was written before _assign_stable_message_ids
+            # stamped the result rows, so it has no `id` while the context copy
+            # does — which would silently defeat id-based fork/truncate alignment
+            # for eager-mode users. Carry the minted id onto the kept checkpoint
+            # so display and context share it (#5564).
+            if (
+                isinstance(msg, dict)
+                and msg.get('id') is not None
+                and isinstance(merged[-1], dict)
+                and merged[-1].get('id') is None
+            ):
+                merged[-1]['id'] = msg['id']
             continue
         if (
             key is not None
@@ -6642,15 +6772,35 @@ def _run_agent_streaming(
         s = get_session(session_id)
         update_active_run(stream_id, phase="running", session_id=session_id)
         s.workspace = str(Path(workspace).expanduser().resolve())
-        s.model = model
+        _last_persisted_model = None
+        _last_persisted_provider = None
+        _turn_owns_persisted_model = False
         provider_context = (
             str(model_provider).strip().lower()
             if model_provider is not None
             else getattr(s, "model_provider", None)
         )
-        s.model_provider = provider_context or None
-
+        provider_context = str(provider_context).strip().lower() if provider_context else None
         _agent_lock = _get_session_agent_lock(session_id)
+        # #4251: the route layer already persisted this turn's model under the
+        # session lock before dispatch, so a mismatch here means a newer picker
+        # write won the race and must not be clobbered by the worker thread.
+        with _agent_lock:
+            _last_persisted_model = getattr(s, "model", None)
+            _last_persisted_provider = getattr(s, "model_provider", None)
+            if _last_persisted_provider is not None:
+                _last_persisted_provider = str(_last_persisted_provider).strip().lower() or None
+            _persisted_model_is_empty = _last_persisted_model in (None, "")
+            _provider_matches = _last_persisted_provider in (None, provider_context)
+            if _persisted_model_is_empty or (
+                _last_persisted_model == model and _provider_matches
+            ):
+                s.model = model
+                s.model_provider = provider_context
+                _last_persisted_model = model
+                _last_persisted_provider = provider_context
+                _turn_owns_persisted_model = True
+
         # TD1: set thread-local env context so concurrent sessions don't clobber globals
         # Check for pre-flight cancel (user cancelled before agent even started)
         if cancel_event.is_set():
@@ -6690,9 +6840,21 @@ def _run_agent_streaming(
             profile_home=_profile_home,
             has_profile=bool(getattr(s, "profile", None)),
         )
-        s.model_provider = provider_context
-        if _repaired and model != (s.model or ""):
-            s.model = model
+        # #4251: only apply the profile-repair persistence if this turn still
+        # owns the session model/provider pair it last wrote.
+        provider_context = str(provider_context).strip().lower() if provider_context else None
+        with _agent_lock:
+            _current_provider = getattr(s, "model_provider", None)
+            if _current_provider is not None:
+                _current_provider = str(_current_provider).strip().lower() or None
+            if (
+                _turn_owns_persisted_model
+                and getattr(s, "model", None) == _last_persisted_model
+                and _current_provider == _last_persisted_provider
+            ):
+                s.model_provider = provider_context
+                if _repaired and model != (s.model or ""):
+                    s.model = model
 
         # Capture the resolved profile name now, while profile context is
         # reliable. Used in the compression migration block to stamp s.profile
@@ -8097,6 +8259,16 @@ def _run_agent_streaming(
                         _previous_context_messages,
                         _result_messages,
                     )
+                    # Stamp stable ids on the shared result rows AFTER the context
+                    # restore (so carried-forward ids survive) and BEFORE the
+                    # dedupe/merge build both arrays — including before
+                    # _dedupe_replayed_context_messages deep-copies any
+                    # stale-user repaired boundary row — so display and
+                    # model-context copies of each row share an id for the
+                    # fork/truncate aligner.
+                    _assign_stable_message_ids(
+                        _result_messages, _previous_messages, _previous_context_messages
+                    )
                     _next_context_messages = _dedupe_replayed_context_messages(
                         _previous_context_messages,
                         _next_context_messages,
@@ -8215,8 +8387,7 @@ def _run_agent_streaming(
                                 )
                         SESSIONS[new_sid] = s
                         SESSIONS.move_to_end(new_sid)
-                        while len(SESSIONS) > SESSIONS_MAX:
-                            SESSIONS.popitem(last=False)
+                        _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
                     # Migrate the per-session lock: alias new_sid to the held
                     # _agent_lock reference directly (not via old_sid lookup),
                     # then remove the old_sid entry to prevent a leak.
@@ -8287,13 +8458,31 @@ def _run_agent_streaming(
                     source=getattr(s, 'pending_user_source', None) or 'webui',
                     drop_replayed_assistant=_drop_replayed_assistant,
                 )
+                _is_agent_result_terminal = _agent_result_terminal_failure(result)
                 _terminal_failure = (
-                    _agent_result_terminal_failure(result)
+                    _is_agent_result_terminal
                     or (
                         _saved_transcript_lacks_final_answer
                         and _classification['type'] not in {'cancelled', 'interrupted'}
                     )
                 )
+                _result_status = str(result.get('status') or result.get('state') or '').strip().lower()
+                _soft_partial_terminal_failure = (
+                    _is_agent_result_terminal
+                    and (_result_status == 'partial' or bool(result.get('partial')))
+                    and _result_status not in {'failed', 'error', 'compression_exhausted'}
+                    and not result.get('failed')
+                    and not result.get('compression_exhausted')
+                    and not _tool_limit_reached
+                    and not _last_err
+                )
+                if (
+                    _terminal_failure
+                    and _soft_partial_terminal_failure
+                    and _classification['type'] == 'no_response'
+                    and not _saved_transcript_lacks_final_answer
+                ):
+                    _terminal_failure = False
                 if _terminal_failure:
                     _assistant_added = False
                 elif _tool_limit_reached and not _session_lacks_final_assistant_answer(s.messages):
@@ -8408,6 +8597,12 @@ def _run_agent_streaming(
                                     _previous_context_messages,
                                     _result_messages,
                                 )
+                                # Mint ids on the shared result rows BEFORE dedupe
+                                # deep-copies any stale-user boundary row, so both
+                                # arrays share the id (#5564).
+                                _assign_stable_message_ids(
+                                    _result_messages, _previous_messages, _previous_context_messages
+                                )
                                 _next_context_messages = _dedupe_replayed_context_messages(
                                     _previous_context_messages,
                                     _next_context_messages,
@@ -8480,12 +8675,25 @@ def _run_agent_streaming(
                             _snapshot_and_append_partial_on_error(s, stream_id)
                         except Exception:
                             logger.debug("Failed to snapshot partials on error for %s", stream_id, exc_info=True)
+                        _error_content = (
+                            f'**{_err_label}:** {_error_payload.get("message") or _err_label}'
+                            + (f'\n\n*{_err_hint}*' if _err_hint else '')
+                        )
                         _error_message = {
                             'role': 'assistant',
-                            'content': f'**{_err_label}:** {_error_payload.get("message") or _err_label}\n\n*{_err_hint}*',
+                            'content': _error_content,
                             'timestamp': int(time.time()),
                             '_error': True,
                         }
+                        if _err_type == 'compression_exhausted':
+                            _recovery = stamp_compression_exhausted_recovery(
+                                s,
+                                message=_error_payload.get('message') or _err_label,
+                                details=_error_payload.get('details') or '',
+                            )
+                            _error_message['_compressionRecovery'] = _recovery
+                            _error_payload['compression_recovery'] = _recovery
+                            _error_payload['recommended_recovery_action'] = _recovery.get('recommended_action')
                         if _error_payload.get('details'):
                             _error_message['provider_details'] = _error_payload['details']
                         if _err_type == 'cancelled':
@@ -9371,6 +9579,7 @@ def _run_agent_streaming(
             put('cancel', _cancel_event_payload('Cancelled by user'))
             return
         _exc_is_quota = _classification['type'] == 'quota_exhausted'
+        _exc_is_credential_pool_empty = _classification['type'] == 'credential_pool_empty'
         # Exception quota text still includes: 'more credits' in _exc_lower, 'can only afford' in _exc_lower, 'fewer max_tokens' in _exc_lower.
         # Rate-limit detection remains guarded as: (not _exc_is_quota).
         _exc_is_rate_limit = (_classification['type'] == 'rate_limit') and (not _exc_is_quota)
@@ -9378,9 +9587,14 @@ def _run_agent_streaming(
         _exc_is_not_found = _classification['type'] == 'model_not_found'  # detects '404', 'not found', 'does not exist', and 'invalid model'.
         _exc_is_cancelled = _classification['type'] == 'cancelled'
         _exc_is_interrupted = _classification['type'] == 'interrupted'
+        _exc_is_compression_exhausted = _classification['type'] == 'compression_exhausted'
 
         # The user hint still points to Settings / `hermes model` from _classify_provider_error().
         if _exc_is_quota:
+            _exc_label, _exc_type, _exc_hint = (
+                _classification['label'], _classification['type'], _classification['hint'],
+            )
+        elif _exc_is_credential_pool_empty:
             _exc_label, _exc_type, _exc_hint = (
                 _classification['label'], _classification['type'], _classification['hint'],
             )
@@ -9464,6 +9678,12 @@ def _run_agent_streaming(
                                 _next_context_messages = _restore_reasoning_metadata(
                                     _previous_context_messages, _result_messages,
                                 )
+                                # Mint ids on the shared result rows BEFORE dedupe
+                                # deep-copies any stale-user boundary row, so both
+                                # arrays share the id (#5564).
+                                _assign_stable_message_ids(
+                                    _result_messages, _previous_messages, _previous_context_messages
+                                )
                                 _next_context_messages = _dedupe_replayed_context_messages(
                                     _previous_context_messages,
                                     _next_context_messages,
@@ -9495,6 +9715,10 @@ def _run_agent_streaming(
                 _classification['label'], _classification['type'], _classification['hint'],
             )
         elif _exc_is_cancelled or _exc_is_interrupted:
+            _exc_label, _exc_type, _exc_hint = (
+                _classification['label'], _classification['type'], _classification['hint'],
+            )
+        elif _exc_is_compression_exhausted:
             _exc_label, _exc_type, _exc_hint = (
                 _classification['label'], _classification['type'], _classification['hint'],
             )
@@ -9537,6 +9761,15 @@ def _run_agent_streaming(
                     'timestamp': int(time.time()),
                     '_error': True,
                 }
+                if _exc_type == 'compression_exhausted':
+                    _recovery = stamp_compression_exhausted_recovery(
+                        s,
+                        message=_error_payload.get('message') or err_str,
+                        details=_error_payload.get('details') or '',
+                    )
+                    _error_message['_compressionRecovery'] = _recovery
+                    _error_payload['compression_recovery'] = _recovery
+                    _error_payload['recommended_recovery_action'] = _recovery.get('recommended_action')
                 if _error_payload.get('details'):
                     _error_message['provider_details'] = _error_payload['details']
                 if _exc_type == 'cancelled':
